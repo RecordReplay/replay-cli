@@ -13,6 +13,7 @@ import { setUserAgent } from "@replay-cli/shared/userAgent";
 import {
   ReplayReporter,
   ReplayReporterConfig,
+  ReporterError,
   TestMetadataV2,
   getAccessToken,
   getMetadataFilePath as getMetadataFilePathBase,
@@ -20,11 +21,15 @@ import {
 } from "@replayio/test-utils";
 import { existsSync, readFileSync } from "fs";
 import path from "path";
-import { WebSocketServer } from "ws";
 import { name as packageName, version as packageVersion } from "../package.json";
-import { FixtureStepStart, ParsedErrorFrame, TestExecutionIdData } from "./fixture";
+import {
+  FixtureStepStart,
+  ParsedErrorFrame,
+  ReporterErrorEvent,
+  TestExecutionIdData,
+} from "./fixture";
 import { StackFrame } from "./playwrightTypes";
-import { getServerPort, startServer } from "./server";
+import { REPLAY_CONTENT_TYPE } from "./constants";
 
 type UserActionEvent = TestMetadataV2.UserActionEvent;
 
@@ -74,11 +79,6 @@ export default class ReplayPlaywrightReporter implements Reporter {
   reporter: ReplayReporter<ReplayPlaywrightRecordingMetadata>;
   captureTestFile: boolean;
   config: ReplayPlaywrightConfig;
-  wss: WebSocketServer;
-  fixtureData: Record<
-    string,
-    { steps: FixtureStep[]; stacks: Record<string, StackFrame[]>; filenames: Set<string> }
-  > = {};
 
   private _executedProjects: Record<string, { usesReplayBrowser: boolean }> = {};
 
@@ -119,41 +119,6 @@ export default class ReplayPlaywrightReporter implements Reporter {
         : ["1", "true"].includes(
             process.env.PLAYWRIGHT_REPLAY_CAPTURE_TEST_FILE?.toLowerCase() || "true"
           );
-    const port = getServerPort();
-    this.wss = startServer({
-      port,
-      onStepStart: (test, step) => {
-        const { steps } = this.getFixtureData(test);
-        steps.push(step);
-      },
-      onStepEnd: (test, step) => {
-        if (!step.error) {
-          return;
-        }
-        const { steps } = this.getFixtureData(test);
-        const s = steps.find(f => f.id === step.id);
-
-        if (s) {
-          s.error = step.error;
-        }
-      },
-      onError: (test, error) => {
-        this.reporter?.addError(error, {
-          ...test,
-        });
-      },
-    });
-  }
-
-  getFixtureData(test: TestExecutionIdData) {
-    const id = this._getTestExecutionId(test);
-    this.fixtureData[id] ??= {
-      steps: [],
-      stacks: {},
-      filenames: new Set(),
-    };
-
-    return this.fixtureData[id];
   }
 
   // Playwright already provides a unique test id:
@@ -216,7 +181,9 @@ export default class ReplayPlaywrightReporter implements Reporter {
     this.reporter.onTestBegin(testExecutionId, getMetadataFilePath(testResult.workerIndex));
   }
 
-  getStepsFromFixture(test: TestExecutionIdData) {
+  private _processAttachments(testId: TestExecutionIdData, attachments: TestResult["attachments"]) {
+    const indexedSteps = new Map<string, UserActionEvent>();
+
     const hookMap: Record<
       "afterAll" | "afterEach" | "beforeAll" | "beforeEach",
       UserActionEvent[]
@@ -226,52 +193,89 @@ export default class ReplayPlaywrightReporter implements Reporter {
       beforeAll: [],
       beforeEach: [],
     };
-    const steps: UserActionEvent[] = [];
 
-    const { steps: fixtureSteps, stacks, filenames } = this.getFixtureData(test);
-    fixtureSteps?.forEach(fixtureStep => {
-      const step: UserActionEvent = {
-        data: {
-          id: fixtureStep.id,
-          parentId: null,
-          command: {
-            name: fixtureStep.apiName,
-            arguments: this.parseArguments(fixtureStep.apiName, fixtureStep.params),
-          },
-          scope: test.source.scope,
-          error: fixtureStep.error || null,
-          category: mapFixtureStepCategory(fixtureStep),
-        },
-      };
+    const main: UserActionEvent[] = [];
 
-      const stack = fixtureStep.frames.map(frame => ({
-        line: frame.line,
-        column: frame.column,
-        functionName: frame.function,
-        file: path.relative(process.cwd(), frame.file),
-      }));
+    const stacks: Record<string, StackFrame[]> = {};
+    const filenames = new Set([testId.filePath]);
 
-      if (stack) {
-        stacks[fixtureStep.id] = stack;
+    for (const attachment of attachments) {
+      if (attachment.contentType !== REPLAY_CONTENT_TYPE || !attachment.body) {
+        continue;
+      }
 
-        for (const frame of stack) {
-          filenames.add(frame.file);
+      switch (attachment.name) {
+        case "replay:step:start": {
+          const fixtureStep = JSON.parse(attachment.body.toString()) as FixtureStep;
+          const step: UserActionEvent = {
+            data: {
+              id: fixtureStep.id,
+              parentId: null,
+              command: {
+                name: fixtureStep.apiName,
+                arguments: this.parseArguments(fixtureStep.apiName, fixtureStep.params),
+              },
+              scope: testId.source.scope,
+              error: null,
+              category: mapFixtureStepCategory(fixtureStep),
+            },
+          };
+
+          indexedSteps.set(fixtureStep.id, step);
+
+          const stack = fixtureStep.frames.map(frame => ({
+            line: frame.line,
+            column: frame.column,
+            functionName: frame.function,
+            file: path.relative(process.cwd(), frame.file),
+          }));
+
+          if (stack) {
+            stacks[fixtureStep.id] = stack;
+
+            for (const frame of stack) {
+              filenames.add(frame.file);
+            }
+          }
+
+          if (fixtureStep.hook) {
+            hookMap[fixtureStep.hook].push(step);
+          } else {
+            main.push(step);
+          }
+          break;
+        }
+        case "replay:step:end": {
+          const fixtureStep = JSON.parse(attachment.body.toString()) as FixtureStep;
+          if (!fixtureStep.error) {
+            break;
+          }
+          const step = indexedSteps.get(fixtureStep.id);
+          if (!step) {
+            break;
+          }
+          step.data.error = fixtureStep.error;
+          break;
+        }
+        case "replay:step:error": {
+          const fixtureEvent = JSON.parse(attachment.body.toString()) as ReporterErrorEvent;
+          this.reporter.addError(
+            new ReporterError(fixtureEvent.code, fixtureEvent.message, fixtureEvent.detail),
+            {
+              ...testId,
+            }
+          );
+          break;
         }
       }
-
-      if (fixtureStep.hook) {
-        hookMap[fixtureStep.hook].push(step);
-      } else {
-        steps.push(step);
-      }
-    });
-
+    }
     return {
-      beforeEach: hookMap.beforeEach,
-      beforeAll: hookMap.beforeAll,
-      afterAll: hookMap.afterAll,
-      afterEach: hookMap.afterEach,
-      main: steps,
+      events: {
+        ...hookMap,
+        main,
+      },
+      filenames,
+      stacks,
     };
   }
 
@@ -286,7 +290,7 @@ export default class ReplayPlaywrightReporter implements Reporter {
     // Don't save metadata for non-Replay projects
     if (!projectMetadata?.usesReplayBrowser) return;
 
-    const testExecutionIdData = {
+    const testExecutionIdData: TestExecutionIdData = {
       filePath: test.location.file,
       projectName: test.parent.project()?.name,
       repeatEachIndex: test.repeatEachIndex,
@@ -294,11 +298,13 @@ export default class ReplayPlaywrightReporter implements Reporter {
       source: this.getSource(test),
     };
 
-    const events = this.getStepsFromFixture(testExecutionIdData);
+    const { events, filenames, stacks } = this._processAttachments(
+      testExecutionIdData,
+      result.attachments
+    );
 
     const relativePath = test.titlePath()[2];
-    const { stacks, filenames } = this.getFixtureData(testExecutionIdData);
-    filenames.add(test.location.file);
+
     let playwrightMetadata: Record<string, any> | undefined;
 
     if (this.captureTestFile) {

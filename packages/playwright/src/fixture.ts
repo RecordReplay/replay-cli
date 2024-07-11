@@ -1,24 +1,17 @@
-import { Browser, TestInfoError, test } from "@playwright/test";
+import { type Browser, type TestInfoError, test } from "@playwright/test";
+import { logger } from "@replay-cli/shared/logger";
 import { ReporterError } from "@replayio/test-utils";
 import assert from "node:assert/strict";
-import dbg from "debug";
-import WebSocket from "ws";
+import { REPLAY_CONTENT_TYPE } from "./constants";
 import { Errors } from "./error";
-import {
+import type {
   ClientInstrumentation,
   ClientInstrumentationListener,
   StackFrame,
   TestInfoInternal,
   TestStepInternal,
 } from "./playwrightTypes";
-import { getServerPort } from "./server";
 import { captureRawStack, filteredStackTrace } from "./stackTrace";
-import { logger } from "@replay-cli/shared/logger";
-import { createDeferred, Deferred } from "@replay-cli/shared/async/createDeferred";
-
-function isErrorWithCode<T extends string>(error: unknown, code: T): error is { code: T } {
-  return !!error && typeof error === "object" && "code" in error && error.code === code;
-}
 
 interface StepStartDetail {
   apiName: string;
@@ -62,14 +55,12 @@ interface FixtureStepEndEvent extends FixtureStepEnd {
   test: TestExecutionIdData;
 }
 
-interface ReporterErrorEvent extends ReporterError {
+export interface ReporterErrorEvent extends ReporterError {
   event: "error";
   test: TestExecutionIdData;
 }
 
 export type FixtureEvent = FixtureStepStartEvent | FixtureStepEndEvent | ReporterErrorEvent;
-
-const debug = dbg("replay:playwright:fixture");
 
 declare global {
   interface Window {
@@ -132,25 +123,6 @@ type Playwright = {
   // it's available (as non-nullable) since 1.34.0
   _instrumentation: ClientInstrumentation;
 };
-
-let wsDeferred: Deferred<WebSocket> | undefined;
-
-async function waitUntilConnected() {
-  if (wsDeferred) {
-    return wsDeferred.promise;
-  }
-  const deferred = (wsDeferred = createDeferred());
-
-  const port = getServerPort();
-  const ws = new WebSocket(`ws://localhost:${port}`);
-
-  ws.on("open", () => deferred.resolve(ws));
-  ws.on("error", error => deferred.reject(error));
-  // TODO: close WS connections on test end
-  // to avoid relying on TestInfo's internals for this the reporter could notify the connection when the test ends
-
-  return wsDeferred.promise;
-}
 
 const fixtureStates = new WeakMap<
   TestInfoInternal,
@@ -292,19 +264,6 @@ export async function replayFixture(
 
   logger.info("ReplayFixture:SettingUp");
 
-  let ws: WebSocket;
-
-  try {
-    ws = await waitUntilConnected();
-  } catch (error) {
-    if (isErrorWithCode(error, "ECONNREFUSED")) {
-      // the reporter didn't end up being used and thus the server is not running
-      await use();
-      return;
-    }
-    throw error;
-  }
-
   async function addAnnotation(event: string, id?: string, detail?: Record<string, any>) {
     if (!id) {
       return;
@@ -356,13 +315,13 @@ export async function replayFixture(
         new ReporterError(Errors.MissingCurrentStep, "No current step for API call end")
       );
 
-      ws.send(
-        JSON.stringify({
+      testInfo.attach(`replay:${data.event}`, {
+        body: JSON.stringify({
           ...detail,
           ...data,
-          test: testIdData,
-        })
-      );
+        }),
+        contentType: REPLAY_CONTENT_TYPE,
+      });
 
       return addAnnotation(data.event, data.id, detail);
     } catch (error) {
@@ -378,17 +337,10 @@ export async function replayFixture(
         reporterError = new ReporterError(Errors.UnexpectedError, "Unknown", { error: error });
       }
 
-      try {
-        ws.send(
-          JSON.stringify({
-            ...reporterError.valueOf(),
-            test: testIdData,
-            event: "error",
-          })
-        );
-      } catch (wsError) {
-        logger.error("ReplayFixture:FailedToSendErrorToReporter", { wsError });
-      }
+      testInfo.attach("replay:step:error", {
+        body: JSON.stringify(reporterError.valueOf()),
+        contentType: REPLAY_CONTENT_TYPE,
+      });
     }
   }
 
