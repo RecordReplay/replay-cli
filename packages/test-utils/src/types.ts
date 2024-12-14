@@ -28,6 +28,10 @@ export type UploadStatusThreshold = "all" | "failed-and-flaky" | "failed";
 
 export type UploadOptions = {
   /**
+   * Maximum number of recordings to upload (within a shard).
+   */
+  maximumLimit?: number;
+  /**
    * Minimize the number of recordings uploaded for a test attempt (within a shard).
    * e.g. Only one recording would be uploaded for a failing test attempt, regardless of retries.
    * e.g. Two recordings would be uploaded for a flaky test attempt (the passing test and one of the failures).

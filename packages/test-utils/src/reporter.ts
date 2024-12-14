@@ -250,6 +250,7 @@ export default class ReplayReporter<
   private _uploadableResults: Map<string, UploadableTestResult<TRecordingMetadata>> = new Map();
   private _testRunShardIdPromise: Promise<TestRunPendingWork> | null = null;
   private _uploadStatusThreshold: UploadStatusThresholdInternal = "none";
+  private _uploadMaxLimit = Infinity;
   private _uploadWorker: UploadWorker | undefined;
   private _uploadedRecordings = new Set<string>();
   private _recordingMetadatas = new Map<
@@ -367,6 +368,12 @@ export default class ReplayReporter<
       if (typeof config.upload === "object") {
         this._minimizeUploads = !!config.upload.minimizeUploads;
         this._uploadStatusThreshold = config.upload.statusThreshold ?? "all";
+        if (typeof config.upload.maximumLimit === "number") {
+          if (!Number.isFinite(config.upload.maximumLimit) || config.upload.maximumLimit <= 0) {
+            throw new Error("`upload.maximumLimit` must be a finite number higher than 0");
+          }
+          this._uploadMaxLimit = config.upload.maximumLimit;
+        }
       } else {
         this._uploadStatusThreshold = "all";
       }
@@ -764,6 +771,9 @@ export default class ReplayReporter<
       logInfo("UploadRecording:AlreadyScheduled", {
         recordingId: recording.id,
       });
+      return;
+    }
+    if (this._uploadedRecordings.size >= this._uploadMaxLimit) {
       return;
     }
     const uploadableRecording = getRecordings().find(r => r.id === recording.id);
